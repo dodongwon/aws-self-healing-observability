@@ -1,109 +1,138 @@
-# AWS 서버리스 관측성 & 자가복구 시스템
-
-서버리스 API에 **로그·메트릭·트레이스** 기반 관측성을 구축하고, 배포 결함으로 에러율이 급증하면 **사람 개입 없이 이전 정상 버전으로 자동 롤백**하는 시스템입니다. 전체 인프라는 Terraform으로, 배포는 GitHub Actions + OIDC로 자동화했습니다.
+# AWS 서버리스 관측성 및 자가복구 시스템
 
 [![deploy](https://github.com/dodongwon/aws-self-healing-observability/actions/workflows/deploy.yml/badge.svg)](https://github.com/dodongwon/aws-self-healing-observability/actions/workflows/deploy.yml)
 
-## 핵심 결과
+배포 결함으로 API 에러율이 급증하면 **운영자 개입 없이 직전 정상 버전으로 자동 롤백**하는 서버리스 시스템입니다.
+로그·메트릭·트레이스 기반 관측성, Terraform 기반 인프라 자동화, OIDC 기반 무(無)키 CI/CD를 함께 구현했습니다.
 
-장애 주입 테스트(`scripts/chaos.sh`)로 요청의 50%가 실패하는 결함 버전을 배포한 뒤, 사람 개입 없이 복구되기까지를 측정했습니다.
+| 항목 | 결과 |
+|---|---|
+| 장애 탐지 시간 (MTTD) | **5분 37초** |
+| 자동 복구 시간 (MTTR) | **5분 38초** (알람 발생 후 롤백 완료까지 1.3초) |
+| 월 운영 비용 | **약 1,600 ~ 5,800원** (무료 티어 미적용 기준) |
+| 장기 Access Key | **0개** (GitHub OIDC 임시 자격증명) |
+| 인프라 코드화 | 전체 44개 리소스를 Terraform으로 관리 |
 
-| 이벤트 (2026-09-28, UTC) | 시각 | 결함 배포 후 경과 |
+---
+
+## 1. 문제 정의
+
+소규모 서비스는 장애를 사용자 제보로 인지하고, 로그를 수동으로 확인한 뒤, 운영자가 직접 재배포하는 방식으로 복구합니다. 이 과정에는 **탐지 지연, 진단 지연, 복구 지연**이 모두 존재하며, 운영자가 대응할 수 없는 시간대에는 장애가 장시간 지속됩니다.
+
+본 프로젝트는 세 단계를 모두 자동화하는 것을 목표로 합니다.
+
+| 단계 | 기존 방식 | 본 시스템 |
 |---|---|---|
-| 결함 버전 v3 배포 (`FAULT_RATE=0.5`) | 11:09:35 | 0s |
-| 알림 알람 `5xx-count` 발생 → 이메일 | 11:11:19.6 | 1분 44초 |
-| 롤백 알람 `5xx-rate` 발생 | 11:15:12.4 | **5분 37초 (MTTD)** |
-| 복구 Lambda가 `live` 별칭을 v3 → v2로 전환 | 11:15:13.7 | **5분 38초 (MTTR)** |
+| 탐지 | 사용자 제보 | CloudWatch 알람 (1분 단위 메트릭) |
+| 진단 | 서버 접속 후 로그 확인 | 대시보드, 구조화 로그, X-Ray 트레이스 |
+| 복구 | 운영자 수동 재배포 | 복구 Lambda가 별칭을 정상 버전으로 전환 |
 
-- 알람 발생 → 롤백 완료까지 **1.3초** — 복구 시간의 대부분은 오탐 방지를 위한 "5분 × 2회 연속" 판정 대기
-- 민감한 알림 알람이 1분 44초 만에 먼저 사람에게 알리고, 보수적인 롤백 알람이 확신을 얻은 뒤 자동 조치 — 알람 이원화 설계가 의도대로 동작
-- 목표(NFR-02: 10분 이내 자동 복구) 충족, 같은 알람 이벤트 재전송 시 `noop` (멱등성 확인)
-- 결함 버전에서 5xx 비율 약 50% (요청 500건 중 256건) → 복구 후 재부하 144건 중 5xx **0건** (재부하는 직후 CI가 같은 코드로 배포한 v4에서 수행)
-
-**CloudWatch 대시보드** — 알람 3종 상태, 요청/5xx, 5xx 비율, 지연시간, Lambda 지표, 자동 롤백 이력(Logs Insights)
-
-![CloudWatch dashboard](docs/images/dashboard.png)
-
-**장애 주입 구간 그래프** — 결함 배포(빨강) → 알림 알람(주황) → 자동 롤백(초록)
-
-![5xx rate during chaos test](docs/images/chaos-error-rate.png)
-
-![requests vs 5xx during chaos test](docs/images/chaos-requests.png)
-
-## 아키텍처
+## 2. 아키텍처
 
 ```
-  GitHub PR ──▶ ci.yml   : ruff · pytest · terraform plan → PR 코멘트 (읽기 전용 Role)
-  main merge ─▶ deploy.yml: terraform apply → 새 버전 게시 → 해당 버전 스모크 테스트 → live 별칭 전환
-                                   │
-┌────────┐   ┌──────────────┐   ┌──────────────────┐   ┌──────────┐
-│ Client │──▶│ API Gateway  │──▶│ Lambda:live 별칭  │──▶│ DynamoDB │
-└────────┘   │  (HTTP API)  │   └────────┬─────────┘   └──────────┘
-             └──────┬───────┘            │  JSON 로그 · EMF 메트릭 · X-Ray
-                    ▼                    ▼
-             ┌─────────────────────────────────────┐
-             │ CloudWatch Logs · Metrics · Dashboard│
-             └──────────────────┬──────────────────┘
-                                ▼
-                  ① 5xx-rate  ② 5xx-count  ③ p99-latency
-                        │              └──────┴──────▶ SNS → 이메일
-                        ▼
-                   EventBridge ──▶ 복구 Lambda ──▶ live 별칭을 last-known-good 버전으로 롤백
+  Pull Request ─▶ ci.yml     : 정적 검사 · 단위 테스트 · terraform plan → PR 코멘트
+  main 병합    ─▶ deploy.yml : terraform apply → 새 버전 게시 → 해당 버전 검증 → 트래픽 전환
+
+┌────────┐   ┌──────────────┐   ┌───────────────────┐   ┌──────────┐
+│ Client │──▶│ API Gateway  │──▶│ Lambda (live 별칭) │──▶│ DynamoDB │
+└────────┘   │  (HTTP API)  │   └─────────┬─────────┘   └──────────┘
+             └──────┬───────┘             │ 구조화 로그 · EMF 메트릭 · X-Ray
+                    ▼                     ▼
+             ┌──────────────────────────────────────┐
+             │  CloudWatch Logs · Metrics · Dashboard │
+             └───────────────────┬──────────────────┘
+                                 ▼
+             ① 5xx 비율 (롤백용)   ② 5xx 건수 · ③ p99 지연 (알림용)
+                      │                       │
+                      ▼                       ▼
+                 EventBridge              SNS → 이메일
+                      ▼
+          복구 Lambda ─▶ live 별칭을 검증된 마지막 버전으로 전환
 ```
 
-## 설계 포인트
+## 3. 자가복구 검증 결과
 
-| 주제 | 결정 | 이유 |
+요청의 50%를 실패시키는 결함 버전을 의도적으로 배포하고(`scripts/chaos.sh`), 복구 과정을 측정했습니다.
+
+| 이벤트 (2026-09-28 UTC) | 시각 | 결함 배포 후 경과 |
 |---|---|---|
-| 불변 배포 | Lambda 버전 + `live` 별칭, API는 별칭을 호출 | 롤백 = 포인터 전환 1회 → 수 초 내 반영 |
-| 롤백 기준 | 스모크 테스트를 통과한 버전만 SSM `last-known-good`에 기록 | "이전 버전"이 아니라 "검증된 버전"으로 복귀 |
-| 알람 이원화 | 자동조치 알람은 보수적(≥10요청 & >5%, 2회 연속), 알림 알람은 민감(5xx ≥3건) | 저트래픽 오탐 롤백 방지 + 저트래픽 장애 미탐 방지 |
-| 멱등 복구 | 현재 버전 = 목표 버전이면 아무것도 안 함 | 알람 이벤트 중복·재시도에도 롤백 1회 |
-| 소유권 분리 | 인프라는 Terraform, 코드·별칭 버전은 CI/복구 Lambda (`ignore_changes`) | `terraform apply`가 롤백을 되돌리지 않음 |
-| 무중단 보장 | 스모크 테스트 실패 시 별칭 전환 안 함 | 결함 버전이 트래픽을 받기 전에 차단 |
-| 키 없는 CI | GitHub OIDC, immutable subject(계정·레포 ID)로 신뢰 | 장기 Access Key 0개, 레포 이름 재사용 사칭 차단 |
-| 최소 권한 | plan(읽기, PR만) / deploy(`obs-app-*` 리소스만, main만) / 복구(별칭 1개만) | 권한 오남용 범위 최소화 |
-| 비용 | 서버리스 + arm64 + 로그 14일 + 스로틀 10rps + Budgets 경보 | 평상시 월 수천 원 이하 |
+| 결함 버전 v3 배포 | 11:09:35 | 0초 |
+| 알림용 알람 발생, 운영자 통보 | 11:11:19 | 1분 44초 |
+| 롤백용 알람 발생 | 11:15:12 | 5분 37초 |
+| 복구 Lambda가 v3 → v2 전환 | 11:15:13 | 5분 38초 |
 
-## 기술 스택
+- 결함 구간 5xx 비율 약 50% (500건 중 256건), 복구 후 재부하 144건 중 5xx 0건
+- 동일 알람 이벤트 재수신 시 추가 롤백 없음 (멱등성)
+- 복구 시간의 대부분은 오탐 방지를 위한 판정 대기(5분 × 2회)이며, 판정 이후 조치는 1.3초 내 완료
 
-Terraform · AWS Lambda (Python 3.12, arm64) · API Gateway HTTP API · DynamoDB · CloudWatch (Logs / Metrics / Alarms / Dashboard) · X-Ray · EventBridge · SNS · SSM Parameter Store · AWS Budgets · Powertools for AWS Lambda · GitHub Actions (OIDC) · pytest / moto
+![CloudWatch 대시보드](docs/images/dashboard.png)
 
-## 직접 재현하기
+![장애 주입 구간 5xx 비율](docs/images/chaos-error-rate.png)
 
-```bash
-# 0) 개인 AWS 프로필 준비 후
-export AWS_PROFILE=personal
+## 4. 핵심 설계
 
-# 1) 기반 리소스 (최초 1회): state 버킷, GitHub OIDC, CI Role
-terraform -chdir=bootstrap init && terraform -chdir=bootstrap apply
+| 설계 | 내용 | 효과 |
+|---|---|---|
+| 불변 배포 | 배포마다 Lambda 버전을 게시하고, API는 `live` 별칭만 호출 | 롤백이 재배포가 아닌 포인터 전환으로 완료 |
+| 검증된 롤백 대상 | 검증을 통과한 버전만 `last-known-good`으로 기록 | 단순 이전 버전이 아닌 정상 확인된 버전으로 복귀 |
+| 알람 이원화 | 자동 조치 알람은 보수적으로(요청 10건 이상, 5% 초과, 2회 연속), 알림 알람은 민감하게(5xx 3건 이상) | 저트래픽 오탐 롤백과 장애 미탐지를 동시에 방지 |
+| 사전 검증 배포 | 새 버전을 직접 호출해 검증한 뒤에만 트래픽 전환 | 결함 버전이 사용자 요청을 받기 전에 차단 |
+| 소유권 분리 | 인프라는 Terraform, 코드와 별칭 버전은 CI와 복구 Lambda가 관리 (`ignore_changes`) | `terraform apply`가 자동 롤백을 되돌리지 않음 |
+| 멱등 복구 | 현재 버전이 목표 버전과 같으면 조치하지 않음 | 이벤트 중복·재시도 시에도 롤백 1회 보장 |
+| 알림 경로 독립 | 모든 알람이 SNS로 직접 통보 | 복구 Lambda 장애 시에도 운영자 통보 보장 |
 
-# 2) 서비스 인프라
-export TF_VAR_alert_email=you@example.com
-terraform -chdir=infra/envs/dev init && terraform -chdir=infra/envs/dev apply
+## 5. 기술 스택
 
-# 3) 테스트
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/pytest -q
+| 영역 | 기술 | 선택 이유 |
+|---|---|---|
+| IaC | Terraform 1.16, AWS Provider 6.x | 모듈 4개(app, api, monitoring, notification)로 분리, S3 네이티브 락으로 락 테이블 제거 |
+| 컴퓨팅 | AWS Lambda (Python 3.12, arm64) | 버전·별칭 기반 즉시 롤백, 사용량 과금, Graviton 단가 절감 |
+| API | API Gateway HTTP API | REST API 대비 요청 단가 약 70% 저렴, 스테이지 단위 스로틀링 |
+| 데이터 | DynamoDB (On-Demand) | 서버 관리 불필요, 저트래픽 시 비용 사실상 0 |
+| 관측성 | CloudWatch Logs · Metrics · Alarms · Dashboard, AWS X-Ray | 로그·메트릭·트레이스 3요소 통합 |
+| 계측 | Powertools for AWS Lambda (Logger, Metrics, Tracer) | 구조화 로그, EMF 커스텀 메트릭, 트레이스를 단일 라이브러리로 구현 |
+| 자가복구 | EventBridge, Lambda, SSM Parameter Store | 알람 상태 변화 이벤트 기반 자동 조치 |
+| 알림·비용 통제 | Amazon SNS, AWS Budgets | 장애 통보, 월 예산 초과 경보 |
+| CI/CD | GitHub Actions, OIDC | 장기 Access Key 없이 배포, PR 단위 인프라 변경 검토 |
+| 테스트 | pytest, moto, ruff | AWS 모킹 기반 단위 테스트, 정적 검사 |
 
-# 4) 자가복구 시연: 결함 버전 배포 → 알람 → 자동 롤백, MTTD/MTTR 출력
-scripts/chaos.sh 0.5
+## 6. 비용 설계
+
+평상시 트래픽(월 10만 건) 기준 **월 약 $1.1 ~ $4.1 (약 1,600 ~ 5,800원)** 으로 운영됩니다. 동일 기능을 EC2와 ALB로 구성하면 월 약 3.6만원이 고정 발생합니다.
+
+| 절감 방식 | 비교 대상 | 절감 효과 |
+|---|---|---|
+| 서버리스 사용량 과금 | EC2 t3.micro + ALB 상시 운영 | 월 약 3.6만원 고정비 제거 |
+| VPC 미사용 | NAT Gateway | 월 약 6만원 고정비 회피 |
+| HTTP API | REST API | 요청 단가 약 70% 절감 |
+| Lambda arm64 | x86_64 | 실행 단가 약 20% 절감 |
+| SSM Parameter Store (Standard) | Secrets Manager | 파라미터당 월 $0.40 회피 |
+| S3 네이티브 락 | DynamoDB 락 테이블 | 리소스 1개 제거 |
+| 로그 보존 14일, X-Ray 기본 샘플링 | 무제한 보존, 전수 추적 | 저장·트레이스 비용 누적 방지 |
+| API 스로틀링 10 rps, AWS Budgets 경보 | 제한 없음 | 비정상 트래픽으로 인한 과금 상한 통제 |
+
+※ 서울 리전 공개 요금 기준 근사치, 환율 1달러 = 1,400원 가정
+
+## 7. 보안 설계
+
+- **무키 CI/CD**: GitHub OIDC 임시 자격증명을 사용하며, 저장된 Access Key가 없습니다.
+- **신뢰 조건 강화**: GitHub immutable subject(계정·레포 숫자 ID)로 신뢰 대상을 지정해, 레포 이름 재사용을 통한 사칭을 차단합니다.
+- **역할 분리**: plan 역할(읽기 전용, PR에서만), deploy 역할(`obs-app-*` 리소스만, main 브랜치에서만), 복구 역할(대상 별칭 1개만)로 권한을 나눴습니다.
+- **입력 검증**: 요청 본문 형식과 크기(10KB)를 검증하고, 오류 응답에 요청 ID를 포함해 로그와 연결합니다.
+
+## 8. 저장소 구조
+
+```
+bootstrap/          Terraform state 버킷, GitHub OIDC Provider, CI용 IAM 역할
+infra/modules/      app · api · monitoring · notification
+infra/envs/dev/     dev 환경 구성
+src/app/            비즈니스 API Lambda
+src/remediation/    자동 롤백 Lambda
+tests/              단위 테스트 (12건)
+scripts/            배포(deploy_app.sh), 부하 생성(load.sh), 장애 주입(chaos.sh)
+docs/               시스템 분석·설계서
 ```
 
-## 디렉토리
+## 9. 문서
 
-```
-bootstrap/            state 버킷, GitHub OIDC Provider, CI용 IAM Role (최초 1회)
-infra/modules/        app · api · monitoring · notification
-infra/envs/dev/       dev 환경 (S3 backend + 네이티브 락)
-src/app/              비즈니스 API Lambda
-src/remediation/      자동 롤백 Lambda
-tests/                pytest + moto
-scripts/              deploy_app.sh · load.sh · chaos.sh
-docs/                 시스템 분석·설계서, 상세 설계
-```
-
-## 문서
-
-- [시스템 분석·설계서](docs/시스템분석설계서.md) — 요구사항 명세(FR/NFR), 타당성·비용 분석, 설계 원칙, 위험 분석, 테스트 계획, RTM
-- [상세 설계](docs/DESIGN.md) — 컴포넌트 설정, 알람 설계, 배포 책임 분리
+- [시스템 분석·설계서](docs/시스템분석설계서.md) — 요구사항 명세, 타당성 분석, 상세 설계, 위험 분석, 테스트 결과
