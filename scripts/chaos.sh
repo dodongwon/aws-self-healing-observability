@@ -11,12 +11,12 @@ set -euo pipefail
 FAULT_RATE=${1:-0.5}
 TIMEOUT=${2:-1500}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-TF="terraform -chdir=$ROOT/infra/envs/dev"
+tf_out() { terraform -chdir="$ROOT/infra/envs/dev" output -raw "$1"; }
 
-ENDPOINT=$($TF output -raw api_endpoint)
-FUNCTION=$($TF output -raw function_name)
-ALIAS=$($TF output -raw alias_name)
-ALARM=$($TF output -raw error_rate_alarm_name)
+ENDPOINT=$(tf_out api_endpoint)
+FUNCTION=$(tf_out function_name)
+ALIAS=$(tf_out alias_name)
+ALARM=$(tf_out error_rate_alarm_name)
 
 now() { date -u +%s; }
 ts() { date -u -r "$1" +%H:%M:%S 2>/dev/null || date -u -d "@$1" +%H:%M:%S; }
@@ -72,8 +72,28 @@ echo "================ Chaos test result ================"
 echo "faulty version     : v$BAD (FAULT_RATE=$FAULT_RATE)"
 echo "known good version : v$GOOD"
 if [[ -n "$T_ROLLBACK" ]]; then
-  [[ -n "$T_ALARM" ]] && echo "MTTD (deploy->alarm)    : $((T_ALARM - T_DEPLOY))s"
-  echo "MTTR (deploy->rollback) : $((T_ROLLBACK - T_DEPLOY))s"
+  # 폴링 간격(15초) 오차를 없애기 위해 AWS 기록에서 정확한 시각을 가져온다
+  #   알람 시각  : CloudWatch 알람 히스토리의 OK -> ALARM 전환
+  #   롤백 시각  : 복구 Lambda 로그의 "Rolled back alias" 이벤트
+  SINCE_MS=$((T_DEPLOY * 1000))
+  ALARM_AT=$(aws cloudwatch describe-alarm-history --alarm-name "$ALARM" --history-item-type StateUpdate \
+    --start-date "$(date -u -r "$T_DEPLOY" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$T_DEPLOY" +%Y-%m-%dT%H:%M:%SZ)" \
+    --query "AlarmHistoryItems[?contains(HistorySummary, 'to ALARM')] | [-1].Timestamp" --output text)
+  ROLLBACK_MS=$(aws logs filter-log-events --log-group-name "/aws/lambda/${FUNCTION%-api}-remediation" \
+    --start-time "$SINCE_MS" --filter-pattern '"Rolled back alias"' --query 'events[].timestamp' --output text | tr '\t' '\n' | grep -m1 '^[0-9]' || true)
+  python3 - "$T_DEPLOY" "$ALARM_AT" "$ROLLBACK_MS" <<'PY'
+import sys
+from datetime import datetime
+deploy, alarm_at, rollback_ms = float(sys.argv[1]), sys.argv[2], sys.argv[3]
+alarm = datetime.fromisoformat(alarm_at).timestamp() if alarm_at not in ("", "None") else None
+rollback = int(rollback_ms) / 1000 if rollback_ms not in ("", "None") else None
+if alarm:
+    print(f"MTTD (deploy->alarm)    : {alarm - deploy:.1f}s")
+if rollback:
+    print(f"MTTR (deploy->rollback) : {rollback - deploy:.1f}s")
+if alarm and rollback:
+    print(f"alarm->rollback         : {rollback - alarm:.1f}s")
+PY
   echo "result             : PASS"
 else
   echo "result             : FAIL — no rollback within ${TIMEOUT}s. Restore manually:"
