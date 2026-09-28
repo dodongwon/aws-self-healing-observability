@@ -59,7 +59,7 @@
 - 참고: HTTP API는 X-Ray 트레이싱을 지원하지 않음 → 트레이스는 Lambda에서 시작 (2.4)
 
 ### 2.2 Lambda (비즈니스 로직)
-- 메모리 256MB, 타임아웃 10초
+- 메모리 256MB, 타임아웃 10초, **arm64(Graviton)** — x86 대비 GB-초 단가 약 20% 저렴
 - `publish = true`로 매 배포마다 **불변 버전** 생성, `live` 별칭이 현재 서비스 버전을 가리킴
 - 설정값은 환경변수(테이블명 등) + SSM Parameter Store Standard(무료). Secrets Manager는 사용 안 함
 - Powertools Layer 사용 → 배포 패키지는 자체 코드만 (콜드스타트·용량 최소화)
@@ -170,10 +170,12 @@ v1은 `terraform apply`와 `aws lambda update-function-code`가 같은 리소스
 ### 5.1 IAM Role 2개 (OIDC)
 | Role | Trust `sub` 조건 | 권한 |
 |---|---|---|
-| `gha-plan-role` | `repo:<OWNER>/<REPO>:pull_request` | ReadOnlyAccess + state 버킷 읽기/락 파일 쓰기 |
-| `gha-deploy-role` | `repo:<OWNER>/<REPO>:ref:refs/heads/main` | 프로젝트 리소스(이름 접두사 `obs-app-*`)에 한정된 쓰기 권한 |
+| `obs-app-gha-plan-role` | `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:pull_request` | ReadOnlyAccess + state 버킷 읽기/락 파일 쓰기 |
+| `obs-app-gha-deploy-role` | `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:ref:refs/heads/main` | 프로젝트 리소스(이름 접두사 `obs-app-*`)에 한정된 쓰기 권한 |
 
 - `aud = sts.amazonaws.com` 조건 필수, 와일드카드 `sub` 금지
+- GitHub **immutable subject**(계정·레포 숫자 ID 포함)로 신뢰 → 레포 이름 변경이나 같은 이름의 레포 재생성으로 신뢰 조건이 오용되지 않음
+- deploy job에 `environment:`를 지정하지 않음 — 지정하면 `sub`가 `environment:<name>`으로 바뀌어 브랜치 조건과 불일치
 
 ### 5.2 ci.yml (PR)
 1. checkout → Python 설치 → `ruff check` + `pytest`
@@ -205,7 +207,7 @@ v1은 `terraform apply`와 `aws lambda update-function-code`가 같은 리소스
 - RDS / EKS / Fargate / EC2 상시 실행 금지
 - 모든 Log Group 보존 14일 (Lambda가 자동 생성하기 전에 Terraform으로 먼저 생성)
 - X-Ray 기본 샘플링 유지 (100% 금지)
-- `load.sh`는 요청 수 상한(예: 2,000건) 하드코딩
+- `load.sh`는 요청 수 상한(3,000건) 하드코딩
 - 데모 끝나면 `FAULT_RATE=0` 버전이 live인지 확인
 
 ---
