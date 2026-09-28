@@ -67,6 +67,11 @@ done
 kill $LOAD_PID 2>/dev/null || true
 wait $LOAD_PID 2>/dev/null || true
 
+if [[ -n "$T_ROLLBACK" ]]; then
+  echo "==> Verifying recovery: 60s of load on the rolled-back version (expect 5xx=0)"
+  "$ROOT/scripts/load.sh" "$ENDPOINT" 60 2 | tail -1
+fi
+
 echo
 echo "================ Chaos test result ================"
 echo "faulty version     : v$BAD (FAULT_RATE=$FAULT_RATE)"
