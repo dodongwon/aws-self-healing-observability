@@ -1,0 +1,5 @@
+aws-lambda-powertools[tracer]>=3,<4
+boto3
+moto[dynamodb,ssm,sns]>=5
+pytest
+ruff

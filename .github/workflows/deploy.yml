@@ -1,0 +1,72 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # OIDC
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # environment: 를 지정하면 OIDC sub 클레임이 'environment:dev'로 바뀌어 Role 신뢰 조건(ref:refs/heads/main)과 맞지 않는다
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Unit tests (gate)
+        run: |
+          pip install -r requirements-dev.txt
+          ruff check .
+          pytest -q
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.16"
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform apply
+        working-directory: infra/envs/dev
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          terraform init -input=false
+          terraform apply -input=false -auto-approve
+
+      - name: Deploy app code (publish → smoke test → switch alias)
+        run: |
+          cd infra/envs/dev
+          FUNCTION=$(terraform output -raw function_name)
+          ALIAS=$(terraform output -raw alias_name)
+          PARAM=$(terraform output -raw last_known_good_param)
+          cd -
+          scripts/deploy_app.sh "$FUNCTION" "$ALIAS" "$PARAM"
+
+      - name: End-to-end check through API Gateway
+        run: |
+          ENDPOINT=$(terraform -chdir=infra/envs/dev output -raw api_endpoint)
+          curl -sf "$ENDPOINT/health" | tee /dev/stderr | grep -q '"status": *"ok"'
