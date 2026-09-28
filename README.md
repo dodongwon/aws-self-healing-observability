@@ -20,6 +20,12 @@
 - 목표(NFR-02: 10분 이내 자동 복구) 충족, 같은 알람 이벤트 재전송 시 `noop` (멱등성 확인)
 - 결함 버전에서 5xx 비율 약 50% (요청 500건 중 256건) → 복구 후 재부하 144건 중 5xx **0건** (재부하는 직후 CI가 같은 코드로 배포한 v4에서 수행)
 
+**CloudWatch 대시보드** — 알람 3종 상태, 요청/5xx, 5xx 비율, 지연시간, Lambda 지표, 자동 롤백 이력(Logs Insights)
+
+![CloudWatch dashboard](docs/images/dashboard.png)
+
+**장애 주입 구간 그래프** — 결함 배포(빨강) → 알림 알람(주황) → 자동 롤백(초록)
+
 ![5xx rate during chaos test](docs/images/chaos-error-rate.png)
 
 ![requests vs 5xx during chaos test](docs/images/chaos-requests.png)
